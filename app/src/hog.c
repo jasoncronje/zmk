@@ -8,6 +8,7 @@
 #include <zephyr/init.h>
 
 #include <limits.h>
+#include <stdint.h>
 #include <string.h>
 
 #include <zephyr/logging/log.h>
@@ -414,11 +415,14 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 
 static int notify_mouse_report(struct bt_conn *conn,
-                               const struct zmk_hid_mouse_report_body *report) {
+                               const struct zmk_hid_mouse_report_body *report,
+                               bt_gatt_complete_func_t complete, void *user_data) {
     struct bt_gatt_notify_params notify_params = {
         .attr = &hog_svc.attrs[13],
         .data = report,
         .len = sizeof(*report),
+        .func = complete,
+        .user_data = user_data,
     };
 
     int err = bt_gatt_notify_cb(conn, &notify_params);
@@ -447,6 +451,13 @@ struct mouse_report_segment {
     bool button_edge_pending;
 };
 
+struct mouse_report_snapshot {
+    struct zmk_hid_mouse_report_body report;
+    uint32_t generation;
+    uint32_t sequence;
+    bool button_edge_pending;
+};
+
 struct mouse_report_coalescer {
     struct mouse_report_segment segments[CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE];
     struct bt_conn *conn;
@@ -455,8 +466,11 @@ struct mouse_report_coalescer {
     zmk_mouse_button_flags_t latest_buttons;
     uint32_t generation;
     uint32_t next_sequence;
-    int64_t last_sent_at;
-    bool has_sent;
+    uint32_t next_notify_token;
+    uint32_t in_flight_token;
+    int64_t retry_not_before;
+    struct mouse_report_snapshot in_flight_snapshot;
+    bool in_flight;
 };
 
 static struct mouse_report_coalescer mouse_coalescer;
@@ -517,8 +531,11 @@ static void mouse_coalescer_reset_locked(void) {
     mouse_coalescer.head = 0;
     mouse_coalescer.count = 0;
     mouse_coalescer.latest_buttons = 0;
-    mouse_coalescer.last_sent_at = 0;
-    mouse_coalescer.has_sent = false;
+    mouse_coalescer.in_flight_token = 0;
+    mouse_coalescer.retry_not_before = 0;
+    memset(&mouse_coalescer.in_flight_snapshot, 0,
+           sizeof(mouse_coalescer.in_flight_snapshot));
+    mouse_coalescer.in_flight = false;
     mouse_coalescer.generation++;
     mouse_coalescer_ensure_segment();
 }
@@ -533,30 +550,28 @@ static void mouse_coalescer_prune_locked(void) {
 }
 
 static bool mouse_coalescer_next_delay_locked(int64_t now, int64_t *delay_ms) {
+    if (mouse_coalescer.in_flight) {
+        return false;
+    }
+
     mouse_coalescer_prune_locked();
     struct mouse_report_segment *segment = mouse_head_segment();
     if (!mouse_segment_has_work(segment)) {
         return false;
     }
 
-    if (segment->button_edge_pending || mouse_coalescer.count > 1 ||
-        !mouse_coalescer.has_sent) {
-        *delay_ms = 0;
-        return true;
-    }
-
-    int64_t elapsed = now - mouse_coalescer.last_sent_at;
-    if (elapsed >= CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS) {
-        *delay_ms = 0;
-    } else {
-        *delay_ms = CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS - elapsed;
-    }
+    *delay_ms = mouse_coalescer.retry_not_before > now
+                    ? mouse_coalescer.retry_not_before - now
+                    : 0;
     return true;
 }
 
 static void schedule_mouse_report(int64_t delay_ms) {
-    k_work_reschedule_for_queue(&hog_mouse_work_q, &hog_mouse_work,
-                                delay_ms > 0 ? K_MSEC(delay_ms) : K_NO_WAIT);
+    int err = k_work_reschedule_for_queue(&hog_mouse_work_q, &hog_mouse_work,
+                                          delay_ms > 0 ? K_MSEC(delay_ms) : K_NO_WAIT);
+    if (err < 0) {
+        LOG_WRN("Failed to schedule mouse report (%d)", err);
+    }
 }
 
 static bool mouse_conn_is_connected(struct bt_conn *conn) {
@@ -565,12 +580,53 @@ static bool mouse_conn_is_connected(struct bt_conn *conn) {
            info.state == BT_CONN_STATE_CONNECTED;
 }
 
-struct mouse_report_snapshot {
-    struct zmk_hid_mouse_report_body report;
-    uint32_t generation;
-    uint32_t sequence;
-    bool button_edge_pending;
-};
+static uint32_t mouse_next_notify_token_locked(void) {
+    mouse_coalescer.next_notify_token++;
+    if (mouse_coalescer.next_notify_token == 0) {
+        mouse_coalescer.next_notify_token++;
+    }
+    return mouse_coalescer.next_notify_token;
+}
+
+static void mouse_report_notify_complete(struct bt_conn *conn, void *user_data) {
+    uint32_t token = (uint32_t)(uintptr_t)user_data;
+    int64_t delay_ms = 0;
+    bool should_schedule = false;
+
+    k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
+
+    if (!mouse_coalescer.in_flight || token != mouse_coalescer.in_flight_token) {
+        k_mutex_unlock(&mouse_coalescer_mutex);
+        return;
+    }
+
+    struct mouse_report_snapshot snapshot = mouse_coalescer.in_flight_snapshot;
+    bool snapshot_matches = mouse_coalescer.conn == conn &&
+                            mouse_coalescer.generation == snapshot.generation &&
+                            mouse_head_segment()->sequence == snapshot.sequence;
+
+    mouse_coalescer.in_flight = false;
+    mouse_coalescer.in_flight_token = 0;
+    mouse_coalescer.retry_not_before = 0;
+
+    if (snapshot_matches) {
+        struct mouse_report_segment *segment = mouse_head_segment();
+        segment->d_x -= snapshot.report.d_x;
+        segment->d_y -= snapshot.report.d_y;
+        segment->d_scroll_y -= snapshot.report.d_scroll_y;
+        segment->d_scroll_x -= snapshot.report.d_scroll_x;
+        if (snapshot.button_edge_pending) {
+            segment->button_edge_pending = false;
+        }
+    }
+
+    should_schedule = mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
+    k_mutex_unlock(&mouse_coalescer_mutex);
+
+    if (should_schedule) {
+        schedule_mouse_report(delay_ms);
+    }
+}
 
 static void send_mouse_report_callback(struct k_work *work) {
     struct mouse_report_snapshot snapshot;
@@ -605,6 +661,10 @@ static void send_mouse_report_callback(struct k_work *work) {
         .sequence = segment->sequence,
         .button_edge_pending = segment->button_edge_pending,
     };
+    uint32_t notify_token = mouse_next_notify_token_locked();
+    mouse_coalescer.in_flight_snapshot = snapshot;
+    mouse_coalescer.in_flight_token = notify_token;
+    mouse_coalescer.in_flight = true;
     if (mouse_coalescer.conn != NULL) {
         conn = bt_conn_ref(mouse_coalescer.conn);
     }
@@ -617,46 +677,50 @@ static void send_mouse_report_callback(struct k_work *work) {
         bt_conn_unref(active_conn);
     }
 
-    int err = connection_matches ? notify_mouse_report(conn, &snapshot.report) : -ENOTCONN;
+    k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
+    bool notify_still_current = mouse_coalescer.in_flight &&
+                                mouse_coalescer.in_flight_token == notify_token &&
+                                mouse_coalescer.generation == snapshot.generation;
+    k_mutex_unlock(&mouse_coalescer_mutex);
+    connection_matches = connection_matches && notify_still_current;
+
+    int err = connection_matches
+                  ? notify_mouse_report(conn, &snapshot.report, mouse_report_notify_complete,
+                                        (void *)(uintptr_t)notify_token)
+                  : -ENOTCONN;
     if (conn != NULL) {
         bt_conn_unref(conn);
     }
 
-    k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
-    bool snapshot_matches = mouse_coalescer.generation == snapshot.generation &&
-                            mouse_head_segment()->sequence == snapshot.sequence;
+    if (err != 0) {
+        k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
+        bool notify_matches = mouse_coalescer.in_flight &&
+                              mouse_coalescer.in_flight_token == notify_token &&
+                              mouse_coalescer.generation == snapshot.generation;
 
-    if (!connection_matches && snapshot_matches) {
-        mouse_coalescer_reset_locked();
-    } else if (err == 0 && snapshot_matches) {
-        segment = mouse_head_segment();
-        segment->d_x -= snapshot.report.d_x;
-        segment->d_y -= snapshot.report.d_y;
-        segment->d_scroll_y -= snapshot.report.d_scroll_y;
-        segment->d_scroll_x -= snapshot.report.d_scroll_x;
-        if (snapshot.button_edge_pending) {
-            segment->button_edge_pending = false;
+        if (notify_matches && (!connection_matches || err == -ENOTCONN)) {
+            mouse_coalescer_reset_locked();
+        } else if (notify_matches) {
+            mouse_coalescer.in_flight = false;
+            mouse_coalescer.in_flight_token = 0;
+            bool transient_error = err == -ENOMEM || err == -ENOBUFS || err == -EAGAIN ||
+                                   err == -EPERM;
+            int64_t retry_delay = transient_error
+                                      ? CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
+                                      : MAX(CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS, 250);
+            mouse_coalescer.retry_not_before = k_uptime_get() + retry_delay;
+            should_schedule =
+                mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
         }
-        mouse_coalescer.last_sent_at = k_uptime_get();
-        mouse_coalescer.has_sent = true;
-        should_schedule =
-            mouse_coalescer_next_delay_locked(mouse_coalescer.last_sent_at, &delay_ms);
-    } else if (snapshot_matches) {
-        should_schedule = true;
-        delay_ms = CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS;
-    } else {
-        should_schedule = mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
-    }
+        k_mutex_unlock(&mouse_coalescer_mutex);
 
-    k_mutex_unlock(&mouse_coalescer_mutex);
-
-    if (should_schedule) {
-        schedule_mouse_report(delay_ms);
+        if (should_schedule) {
+            schedule_mouse_report(delay_ms);
+        }
     }
 }
 
 void zmk_hog_reset_mouse_reports(void) {
-    k_work_cancel_delayable(&hog_mouse_work);
     k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
     mouse_coalescer_reset_locked();
     k_mutex_unlock(&mouse_coalescer_mutex);
@@ -761,7 +825,7 @@ static void send_mouse_report_callback(struct k_work *work) {
             return;
         }
 
-        notify_mouse_report(conn, &report);
+        notify_mouse_report(conn, &report, NULL, NULL);
         bt_conn_unref(conn);
     }
 }
