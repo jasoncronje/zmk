@@ -30,7 +30,7 @@ static struct zmk_endpoint_instance current_instance = {};
 static enum zmk_transport preferred_transport =
     ZMK_TRANSPORT_USB; /* Used if multiple endpoints are ready */
 
-static void update_current_endpoint(void);
+static bool update_current_endpoint(void);
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 static void endpoints_save_preferred_work(struct k_work *work) {
@@ -340,10 +340,14 @@ void zmk_endpoints_clear_current(void) {
     zmk_endpoints_send_report(HID_USAGE_CONSUMER);
 }
 
-static void update_current_endpoint(void) {
+static bool update_current_endpoint(void) {
     struct zmk_endpoint_instance new_instance = get_selected_instance();
 
     if (!zmk_endpoint_instance_eq(new_instance, current_instance)) {
+#if IS_ENABLED(CONFIG_ZMK_BLE) && IS_ENABLED(CONFIG_ZMK_POINTING)
+        zmk_hog_reset_mouse_reports();
+#endif
+
         // Cancel all current keypresses so keys don't stay held on the old endpoint.
         zmk_endpoints_clear_current();
 
@@ -354,11 +358,25 @@ static void update_current_endpoint(void) {
         LOG_INF("Endpoint changed: %s", endpoint_str);
 
         raise_zmk_endpoint_changed((struct zmk_endpoint_changed){.endpoint = current_instance});
+        return true;
     }
+
+    return false;
 }
 
 static int endpoint_listener(const zmk_event_t *eh) {
+#if IS_ENABLED(CONFIG_ZMK_BLE) && IS_ENABLED(CONFIG_ZMK_POINTING)
+    bool endpoint_changed = update_current_endpoint();
+
+    // A reconnect on the same profile does not change the selected endpoint,
+    // but must still discard motion bound to the old connection.
+    if (!endpoint_changed && as_zmk_ble_active_profile_changed(eh) != NULL) {
+        zmk_hog_reset_mouse_reports();
+    }
+#else
     update_current_endpoint();
+#endif
+
     return 0;
 }
 
