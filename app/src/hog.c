@@ -440,6 +440,12 @@ static int notify_mouse_report(struct bt_conn *conn,
 
 BUILD_ASSERT(CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE > 1,
              "Mouse report queue size must be greater than one");
+BUILD_ASSERT(CONFIG_ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT >= 2,
+             "Mouse report window must contain at least two notifications");
+BUILD_ASSERT(CONFIG_BT_BUF_ACL_TX_COUNT >= CONFIG_ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT + 2,
+             "Mouse report window must leave two ACL TX buffers available");
+BUILD_ASSERT(CONFIG_BT_L2CAP_TX_BUF_COUNT >= CONFIG_ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT + 2,
+             "Mouse report window must leave two L2CAP TX buffers available");
 
 struct mouse_report_segment {
     int64_t d_x;
@@ -458,6 +464,19 @@ struct mouse_report_snapshot {
     bool button_edge_pending;
 };
 
+enum mouse_notify_slot_state {
+    MOUSE_NOTIFY_SLOT_FREE,
+    MOUSE_NOTIFY_SLOT_SUBMITTING,
+    MOUSE_NOTIFY_SLOT_ACTIVE,
+    MOUSE_NOTIFY_SLOT_COMPLETED,
+};
+
+struct mouse_notify_slot {
+    uint32_t token;
+    uint32_t generation;
+    enum mouse_notify_slot_state state;
+};
+
 struct mouse_report_coalescer {
     struct mouse_report_segment segments[CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE];
     struct bt_conn *conn;
@@ -467,10 +486,11 @@ struct mouse_report_coalescer {
     uint32_t generation;
     uint32_t next_sequence;
     uint32_t next_notify_token;
-    uint32_t in_flight_token;
+    struct mouse_notify_slot notify_slots[CONFIG_ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT];
+    size_t in_flight_count;
+    int64_t last_sent_at;
     int64_t retry_not_before;
-    struct mouse_report_snapshot in_flight_snapshot;
-    bool in_flight;
+    bool has_sent;
 };
 
 static struct mouse_report_coalescer mouse_coalescer;
@@ -531,11 +551,11 @@ static void mouse_coalescer_reset_locked(void) {
     mouse_coalescer.head = 0;
     mouse_coalescer.count = 0;
     mouse_coalescer.latest_buttons = 0;
-    mouse_coalescer.in_flight_token = 0;
+    memset(mouse_coalescer.notify_slots, 0, sizeof(mouse_coalescer.notify_slots));
+    mouse_coalescer.in_flight_count = 0;
+    mouse_coalescer.last_sent_at = 0;
     mouse_coalescer.retry_not_before = 0;
-    memset(&mouse_coalescer.in_flight_snapshot, 0,
-           sizeof(mouse_coalescer.in_flight_snapshot));
-    mouse_coalescer.in_flight = false;
+    mouse_coalescer.has_sent = false;
     mouse_coalescer.generation++;
     mouse_coalescer_ensure_segment();
 }
@@ -550,7 +570,7 @@ static void mouse_coalescer_prune_locked(void) {
 }
 
 static bool mouse_coalescer_next_delay_locked(int64_t now, int64_t *delay_ms) {
-    if (mouse_coalescer.in_flight) {
+    if (mouse_coalescer.in_flight_count >= CONFIG_ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT) {
         return false;
     }
 
@@ -560,9 +580,21 @@ static bool mouse_coalescer_next_delay_locked(int64_t now, int64_t *delay_ms) {
         return false;
     }
 
-    *delay_ms = mouse_coalescer.retry_not_before > now
-                    ? mouse_coalescer.retry_not_before - now
-                    : 0;
+    if (mouse_coalescer.retry_not_before > now) {
+        *delay_ms = mouse_coalescer.retry_not_before - now;
+        return true;
+    }
+
+    if (segment->button_edge_pending || mouse_coalescer.count > 1 ||
+        !mouse_coalescer.has_sent) {
+        *delay_ms = 0;
+        return true;
+    }
+
+    int64_t elapsed = now - mouse_coalescer.last_sent_at;
+    *delay_ms = elapsed >= CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
+                    ? 0
+                    : CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS - elapsed;
     return true;
 }
 
@@ -588,6 +620,46 @@ static uint32_t mouse_next_notify_token_locked(void) {
     return mouse_coalescer.next_notify_token;
 }
 
+static struct mouse_notify_slot *mouse_notify_slot_for_token_locked(uint32_t token) {
+    for (size_t i = 0; i < ARRAY_SIZE(mouse_coalescer.notify_slots); i++) {
+        if (mouse_coalescer.notify_slots[i].state != MOUSE_NOTIFY_SLOT_FREE &&
+            mouse_coalescer.notify_slots[i].token == token) {
+            return &mouse_coalescer.notify_slots[i];
+        }
+    }
+
+    return NULL;
+}
+
+static struct mouse_notify_slot *mouse_reserve_notify_slot_locked(uint32_t generation,
+                                                                   uint32_t *token) {
+    for (size_t i = 0; i < ARRAY_SIZE(mouse_coalescer.notify_slots); i++) {
+        struct mouse_notify_slot *slot = &mouse_coalescer.notify_slots[i];
+        if (slot->state == MOUSE_NOTIFY_SLOT_FREE) {
+            *token = mouse_next_notify_token_locked();
+            *slot = (struct mouse_notify_slot){
+                .token = *token,
+                .generation = generation,
+                .state = MOUSE_NOTIFY_SLOT_SUBMITTING,
+            };
+            mouse_coalescer.in_flight_count++;
+            return slot;
+        }
+    }
+
+    return NULL;
+}
+
+static void mouse_release_notify_slot_locked(struct mouse_notify_slot *slot) {
+    if (slot == NULL || slot->state == MOUSE_NOTIFY_SLOT_FREE) {
+        return;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    __ASSERT_NO_MSG(mouse_coalescer.in_flight_count > 0);
+    mouse_coalescer.in_flight_count--;
+}
+
 static void mouse_report_notify_complete(struct bt_conn *conn, void *user_data) {
     uint32_t token = (uint32_t)(uintptr_t)user_data;
     int64_t delay_ms = 0;
@@ -595,30 +667,20 @@ static void mouse_report_notify_complete(struct bt_conn *conn, void *user_data) 
 
     k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
 
-    if (!mouse_coalescer.in_flight || token != mouse_coalescer.in_flight_token) {
+    struct mouse_notify_slot *slot = mouse_notify_slot_for_token_locked(token);
+    if (slot == NULL || slot->generation != mouse_coalescer.generation ||
+        mouse_coalescer.conn != conn) {
         k_mutex_unlock(&mouse_coalescer_mutex);
         return;
     }
 
-    struct mouse_report_snapshot snapshot = mouse_coalescer.in_flight_snapshot;
-    bool snapshot_matches = mouse_coalescer.conn == conn &&
-                            mouse_coalescer.generation == snapshot.generation &&
-                            mouse_head_segment()->sequence == snapshot.sequence;
-
-    mouse_coalescer.in_flight = false;
-    mouse_coalescer.in_flight_token = 0;
-    mouse_coalescer.retry_not_before = 0;
-
-    if (snapshot_matches) {
-        struct mouse_report_segment *segment = mouse_head_segment();
-        segment->d_x -= snapshot.report.d_x;
-        segment->d_y -= snapshot.report.d_y;
-        segment->d_scroll_y -= snapshot.report.d_scroll_y;
-        segment->d_scroll_x -= snapshot.report.d_scroll_x;
-        if (snapshot.button_edge_pending) {
-            segment->button_edge_pending = false;
-        }
+    if (slot->state == MOUSE_NOTIFY_SLOT_SUBMITTING) {
+        slot->state = MOUSE_NOTIFY_SLOT_COMPLETED;
+        k_mutex_unlock(&mouse_coalescer_mutex);
+        return;
     }
+
+    mouse_release_notify_slot_locked(slot);
 
     should_schedule = mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
     k_mutex_unlock(&mouse_coalescer_mutex);
@@ -631,6 +693,7 @@ static void mouse_report_notify_complete(struct bt_conn *conn, void *user_data) 
 static void send_mouse_report_callback(struct k_work *work) {
     struct mouse_report_snapshot snapshot;
     struct bt_conn *conn = NULL;
+    uint32_t notify_token = 0;
     int64_t delay_ms = 0;
     bool should_schedule = false;
 
@@ -661,10 +724,9 @@ static void send_mouse_report_callback(struct k_work *work) {
         .sequence = segment->sequence,
         .button_edge_pending = segment->button_edge_pending,
     };
-    uint32_t notify_token = mouse_next_notify_token_locked();
-    mouse_coalescer.in_flight_snapshot = snapshot;
-    mouse_coalescer.in_flight_token = notify_token;
-    mouse_coalescer.in_flight = true;
+    struct mouse_notify_slot *slot =
+        mouse_reserve_notify_slot_locked(snapshot.generation, &notify_token);
+    __ASSERT_NO_MSG(slot != NULL);
     if (mouse_coalescer.conn != NULL) {
         conn = bt_conn_ref(mouse_coalescer.conn);
     }
@@ -678,8 +740,10 @@ static void send_mouse_report_callback(struct k_work *work) {
     }
 
     k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
-    bool notify_still_current = mouse_coalescer.in_flight &&
-                                mouse_coalescer.in_flight_token == notify_token &&
+    slot = mouse_notify_slot_for_token_locked(notify_token);
+    bool notify_still_current = slot != NULL &&
+                                slot->state == MOUSE_NOTIFY_SLOT_SUBMITTING &&
+                                slot->generation == snapshot.generation &&
                                 mouse_coalescer.generation == snapshot.generation;
     k_mutex_unlock(&mouse_coalescer_mutex);
     connection_matches = connection_matches && notify_still_current;
@@ -692,31 +756,54 @@ static void send_mouse_report_callback(struct k_work *work) {
         bt_conn_unref(conn);
     }
 
-    if (err != 0) {
-        k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
-        bool notify_matches = mouse_coalescer.in_flight &&
-                              mouse_coalescer.in_flight_token == notify_token &&
-                              mouse_coalescer.generation == snapshot.generation;
+    k_mutex_lock(&mouse_coalescer_mutex, K_FOREVER);
+    slot = mouse_notify_slot_for_token_locked(notify_token);
+    bool notify_matches = slot != NULL && slot->generation == snapshot.generation &&
+                          mouse_coalescer.generation == snapshot.generation;
+    bool snapshot_matches = mouse_coalescer.generation == snapshot.generation &&
+                            mouse_head_segment()->sequence == snapshot.sequence;
 
-        if (notify_matches && (!connection_matches || err == -ENOTCONN)) {
-            mouse_coalescer_reset_locked();
-        } else if (notify_matches) {
-            mouse_coalescer.in_flight = false;
-            mouse_coalescer.in_flight_token = 0;
+    if (notify_matches && (!connection_matches || err == -ENOTCONN)) {
+        mouse_coalescer_reset_locked();
+    } else if (notify_matches && err == 0 && snapshot_matches) {
+        segment = mouse_head_segment();
+        segment->d_x -= snapshot.report.d_x;
+        segment->d_y -= snapshot.report.d_y;
+        segment->d_scroll_y -= snapshot.report.d_scroll_y;
+        segment->d_scroll_x -= snapshot.report.d_scroll_x;
+        if (snapshot.button_edge_pending) {
+            segment->button_edge_pending = false;
+        }
+
+        mouse_coalescer.last_sent_at = k_uptime_get();
+        mouse_coalescer.retry_not_before = 0;
+        mouse_coalescer.has_sent = true;
+
+        if (slot->state == MOUSE_NOTIFY_SLOT_COMPLETED) {
+            mouse_release_notify_slot_locked(slot);
+        } else {
+            slot->state = MOUSE_NOTIFY_SLOT_ACTIVE;
+        }
+        should_schedule =
+            mouse_coalescer_next_delay_locked(mouse_coalescer.last_sent_at, &delay_ms);
+    } else if (notify_matches) {
+        mouse_release_notify_slot_locked(slot);
+        if (err != 0) {
             bool transient_error = err == -ENOMEM || err == -ENOBUFS || err == -EAGAIN ||
                                    err == -EPERM;
             int64_t retry_delay = transient_error
                                       ? CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
                                       : MAX(CONFIG_ZMK_BLE_MOUSE_REPORT_INTERVAL_MS, 250);
             mouse_coalescer.retry_not_before = k_uptime_get() + retry_delay;
-            should_schedule =
-                mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
         }
-        k_mutex_unlock(&mouse_coalescer_mutex);
+        should_schedule = mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
+    } else {
+        should_schedule = mouse_coalescer_next_delay_locked(k_uptime_get(), &delay_ms);
+    }
+    k_mutex_unlock(&mouse_coalescer_mutex);
 
-        if (should_schedule) {
-            schedule_mouse_report(delay_ms);
-        }
+    if (should_schedule) {
+        schedule_mouse_report(delay_ms);
     }
 }
 

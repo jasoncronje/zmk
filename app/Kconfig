@@ -210,16 +210,27 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     default 20
 
 config ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
-    int "BLE mouse retry interval in milliseconds"
+    int "BLE mouse report interval in milliseconds"
     default 0
     range 0 1000
     depends on ZMK_POINTING
     help
       A nonzero value enables lossless relative mouse movement and scroll
-      coalescing paced by actual BLE notification completion. This value is the
-      retry delay after transient transport allocation failures. A value of 0
-      disables coalescing. Button transitions remain ordered and accumulated
-      relative movement is preserved.
+      coalescing at the configured interval. A bounded notification window
+      prevents deep transport backlog while keeping the next report ready for
+      the following connection event. A value of 0 disables coalescing. Button
+      transitions remain ordered and accumulated relative movement is preserved.
+
+config ZMK_BLE_MOUSE_REPORT_MAX_IN_FLIGHT
+    int "Maximum BLE mouse notifications in flight"
+    default 3
+    range 2 8
+    depends on ZMK_POINTING
+    depends on ZMK_BLE_MOUSE_REPORT_INTERVAL_MS > 0
+    help
+      Limits queued BLE mouse notifications. The bounded window pipelines
+      consecutive connection events and tolerates delayed completion callbacks
+      without allowing a deep stale-report backlog.
 
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
