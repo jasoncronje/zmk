@@ -13,7 +13,6 @@
 #include <stdio.h>
 
 #include <zephyr/settings/settings.h>
-#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -499,80 +498,6 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
 }
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT)
-
-#define BLE_CONN_PARAM_ENFORCEMENT_INITIAL_DELAY                                             \
-    K_MSEC(CONFIG_BT_CONN_PARAM_UPDATE_TIMEOUT + 1500)
-#define BLE_CONN_PARAM_ENFORCEMENT_RETRY_DELAY K_MSEC(5000)
-
-static atomic_t ble_conn_param_enforcement_attempts;
-static atomic_t ble_conn_param_enforcement_generation;
-
-static void ble_conn_param_enforcement_work_handler(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(ble_conn_param_enforcement_work,
-                        ble_conn_param_enforcement_work_handler);
-
-static bool ble_conn_params_are_preferred(uint16_t interval, uint16_t latency) {
-    return interval <= CONFIG_BT_PERIPHERAL_PREF_MAX_INT &&
-           latency <= CONFIG_BT_PERIPHERAL_PREF_LATENCY;
-}
-
-static void ble_conn_param_enforcement_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-
-    atomic_val_t generation = atomic_get(&ble_conn_param_enforcement_generation);
-    struct bt_conn *conn = zmk_ble_active_profile_conn();
-    if (conn == NULL) {
-        return;
-    }
-
-    struct bt_conn_info info;
-    int err = bt_conn_get_info(conn, &info);
-    if (err < 0 || info.state != BT_CONN_STATE_CONNECTED ||
-        info.role != BT_CONN_ROLE_PERIPHERAL) {
-        bt_conn_unref(conn);
-        return;
-    }
-
-    if (ble_conn_params_are_preferred(info.le.interval, info.le.latency)) {
-        atomic_set(&ble_conn_param_enforcement_attempts, 0);
-        bt_conn_unref(conn);
-        return;
-    }
-
-    atomic_val_t attempts = atomic_get(&ble_conn_param_enforcement_attempts);
-    if (attempts >= CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT_ATTEMPTS) {
-        LOG_WRN("Host BLE connection remained at interval %u latency %u after %d retries",
-                info.le.interval, info.le.latency, attempts);
-        bt_conn_unref(conn);
-        return;
-    }
-
-    atomic_inc(&ble_conn_param_enforcement_attempts);
-    err = bt_conn_le_param_update(
-        conn, BT_LE_CONN_PARAM(CONFIG_BT_PERIPHERAL_PREF_MIN_INT,
-                               CONFIG_BT_PERIPHERAL_PREF_MAX_INT,
-                               CONFIG_BT_PERIPHERAL_PREF_LATENCY,
-                               CONFIG_BT_PERIPHERAL_PREF_TIMEOUT));
-    bt_conn_unref(conn);
-
-    if (err == -EALREADY) {
-        atomic_set(&ble_conn_param_enforcement_attempts, 0);
-        return;
-    }
-
-    if (err < 0) {
-        LOG_WRN("Failed to request preferred host BLE parameters (%d)", err);
-    }
-
-    if (generation == atomic_get(&ble_conn_param_enforcement_generation)) {
-        k_work_reschedule(&ble_conn_param_enforcement_work,
-                          BLE_CONN_PARAM_ENFORCEMENT_RETRY_DELAY);
-    }
-}
-
-#endif /* IS_ENABLED(CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT) */
-
 static void connected(struct bt_conn *conn, uint8_t err) {
     char addr[BT_ADDR_LE_STR_LEN];
     struct bt_conn_info info;
@@ -596,15 +521,6 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     LOG_DBG("Connected %s", addr);
 
-#if IS_ENABLED(CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT)
-    if (is_conn_active_profile(conn) || zmk_ble_active_profile_is_open()) {
-        atomic_inc(&ble_conn_param_enforcement_generation);
-        atomic_set(&ble_conn_param_enforcement_attempts, 0);
-        k_work_reschedule(&ble_conn_param_enforcement_work,
-                          BLE_CONN_PARAM_ENFORCEMENT_INITIAL_DELAY);
-    }
-#endif
-
     update_advertising();
 
     if (is_conn_active_profile(conn)) {
@@ -627,14 +543,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         LOG_DBG("SKIPPING FOR ROLE %d", info.role);
         return;
     }
-
-#if IS_ENABLED(CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT)
-    if (is_conn_active_profile(conn) || zmk_ble_active_profile_is_open()) {
-        atomic_inc(&ble_conn_param_enforcement_generation);
-        k_work_cancel_delayable(&ble_conn_param_enforcement_work);
-        atomic_set(&ble_conn_param_enforcement_attempts, 0);
-    }
-#endif
 
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
@@ -665,22 +573,6 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t l
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_DBG("%s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
-
-#if IS_ENABLED(CONFIG_ZMK_BLE_CONN_PARAM_ENFORCEMENT)
-    struct bt_conn_info info;
-    if (bt_conn_get_info(conn, &info) < 0 || info.role != BT_CONN_ROLE_PERIPHERAL ||
-        !is_conn_active_profile(conn)) {
-        return;
-    }
-
-    if (ble_conn_params_are_preferred(interval, latency)) {
-        k_work_cancel_delayable(&ble_conn_param_enforcement_work);
-        atomic_set(&ble_conn_param_enforcement_attempts, 0);
-    } else if (atomic_get(&ble_conn_param_enforcement_attempts) > 0) {
-        k_work_reschedule(&ble_conn_param_enforcement_work,
-                          BLE_CONN_PARAM_ENFORCEMENT_RETRY_DELAY);
-    }
-#endif
 }
 
 static struct bt_conn_cb conn_callbacks = {

@@ -220,24 +220,6 @@ config ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
       coalescing. Button changes are always sent immediately, and accumulated
       relative movement is preserved and flushed after the interval.
 
-config ZMK_BLE_CONN_PARAM_ENFORCEMENT
-    bool "Retry preferred BLE connection parameters"
-    default n
-    depends on BT_PERIPHERAL && BT_GAP_AUTO_UPDATE_CONN_PARAMS
-    depends on BT_GAP_PERIPHERAL_PREF_PARAMS
-    depends on !ZMK_SPLIT_BLE || ZMK_SPLIT_ROLE_CENTRAL
-    help
-      Recheck the active host connection after the standard GAP parameter
-      update and retry the preferred parameters when the host leaves the link
-      at a slower interval. Retries are bounded and stop after disconnect or a
-      successful update.
-
-config ZMK_BLE_CONN_PARAM_ENFORCEMENT_ATTEMPTS
-    int "Preferred BLE connection parameter retry attempts"
-    default 3
-    range 1 10
-    depends on ZMK_BLE_CONN_PARAM_ENFORCEMENT
-
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 
