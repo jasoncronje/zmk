@@ -136,6 +136,24 @@ static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
 
+#define SPLIT_CENTRAL_SCAN_RETRY_DELAY_MS 500
+
+static void split_central_scan_retry_work_handler(struct k_work *work) { start_scanning(); }
+
+K_WORK_DELAYABLE_DEFINE(split_central_scan_retry_work, split_central_scan_retry_work_handler);
+
+static void schedule_scan_retry(void) {
+    if (!is_enabled) {
+        return;
+    }
+
+    int err = k_work_reschedule(&split_central_scan_retry_work,
+                                K_MSEC(SPLIT_CENTRAL_SCAN_RETRY_DELAY_MS));
+    if (err < 0) {
+        LOG_WRN("Failed to schedule split scan recovery (%d)", err);
+    }
+}
+
 static const struct bt_uuid_128 split_service_uuid = BT_UUID_INIT_128(ZMK_SPLIT_BT_SERVICE_UUID);
 
 struct peripheral_event_wrapper {
@@ -783,14 +801,20 @@ static void split_central_process_connection(struct bt_conn *conn) {
 
 static int stop_scanning(void) {
     LOG_DBG("Stopping peripheral scanning");
-    is_scanning = false;
 
     int err = bt_le_scan_stop();
+    if (err == -EALREADY) {
+        err = 0;
+    }
+
+    is_scanning = false;
     if (err < 0) {
         LOG_ERR("Stop LE scan failed (err %d)", err);
+        schedule_scan_retry();
         return err;
     }
 
+    k_work_cancel_delayable(&split_central_scan_retry_work);
     return 0;
 }
 
@@ -810,6 +834,7 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     // Stop scanning so we can connect to the peripheral device.
     int err = stop_scanning();
     if (err < 0) {
+        release_peripheral_slot(slot_idx);
         return false;
     }
 
@@ -894,10 +919,10 @@ static int start_scanning(void) {
         return 0;
     }
 
-    // If all the devices are connected, there is no need to scan.
+    // If all slots are connected or connecting, there is no need to scan.
     bool has_unconnected = false;
     for (int i = 0; i < CONFIG_ZMK_SPLIT_BLE_CENTRAL_PERIPHERALS; i++) {
-        if (peripherals[i].conn == NULL) {
+        if (peripherals[i].state == PERIPHERAL_SLOT_STATE_OPEN) {
             has_unconnected = true;
             break;
         }
@@ -907,14 +932,23 @@ static int start_scanning(void) {
         return 0;
     }
 
-    // Start scanning otherwise.
-    is_scanning = true;
+    // Start scanning otherwise. Do not publish the running state until Zephyr
+    // confirms that the controller accepted the scan.
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
+    if (err == -EALREADY) {
+        is_scanning = true;
+        k_work_cancel_delayable(&split_central_scan_retry_work);
+        return 0;
+    }
     if (err < 0) {
+        is_scanning = false;
         LOG_ERR("Scanning failed to start (err %d)", err);
+        schedule_scan_retry();
         return err;
     }
 
+    is_scanning = true;
+    k_work_cancel_delayable(&split_central_scan_retry_work);
     LOG_DBG("Scanning successfully started");
     return 0;
 }
@@ -950,7 +984,15 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
 
 static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     char addr[BT_ADDR_LE_STR_LEN];
-    int err;
+    int slot_idx = peripheral_slot_index_for_conn(conn);
+
+    // This callback receives every Bluetooth disconnect, including the Mac
+    // host connection where this keyboard is the peripheral. Only split
+    // peripheral connections own a slot here.
+    if (slot_idx < 0) {
+        LOG_DBG("Skipping non-split connection disconnect");
+        return;
+    }
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
@@ -958,7 +1000,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {
-        .source = peripheral_slot_index_for_conn(conn),
+        .source = slot_idx,
         .event = {.type = ZMK_SPLIT_TRANSPORT_PERIPHERAL_EVENT_TYPE_BATTERY_EVENT,
                   .data = {.battery_event = {
                                .level = 0,
@@ -976,7 +1018,7 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     release_peripheral_input_subs(conn);
 #endif
 
-    err = release_peripheral_slot_for_conn(conn);
+    int err = release_peripheral_slot(slot_idx);
 
     if (err < 0) {
         LOG_WRN("Failed to release peripheral slot (%d)", err);
