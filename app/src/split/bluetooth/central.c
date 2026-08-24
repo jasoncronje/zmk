@@ -138,7 +138,10 @@ static bool is_scanning = false;
 
 #define SPLIT_CENTRAL_SCAN_RETRY_DELAY_MS 500
 
-static void split_central_scan_retry_work_handler(struct k_work *work) { start_scanning(); }
+static void split_central_scan_retry_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    start_scanning();
+}
 
 K_WORK_DELAYABLE_DEFINE(split_central_scan_retry_work, split_central_scan_retry_work_handler);
 
@@ -814,7 +817,6 @@ static int stop_scanning(void) {
         return err;
     }
 
-    k_work_cancel_delayable(&split_central_scan_retry_work);
     return 0;
 }
 
@@ -932,12 +934,11 @@ static int start_scanning(void) {
         return 0;
     }
 
-    // Start scanning otherwise. Do not publish the running state until Zephyr
-    // confirms that the controller accepted the scan.
+    // Latch before the call to guard against a scan callback running before
+    // bt_le_scan_start() returns. Roll the state back if the start fails.
+    is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
     if (err == -EALREADY) {
-        is_scanning = true;
-        k_work_cancel_delayable(&split_central_scan_retry_work);
         return 0;
     }
     if (err < 0) {
@@ -947,8 +948,6 @@ static int start_scanning(void) {
         return err;
     }
 
-    is_scanning = true;
-    k_work_cancel_delayable(&split_central_scan_retry_work);
     LOG_DBG("Scanning successfully started");
     return 0;
 }
