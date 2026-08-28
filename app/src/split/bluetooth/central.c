@@ -32,6 +32,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/battery_state_changed.h>
 #include <zmk/pointing/input_split.h>
 #include <zmk/hid_indicators_types.h>
+#include <zmk/keyball_diag.h>
 #include <zmk/physical_layouts.h>
 
 static int start_scanning(void);
@@ -136,6 +137,10 @@ static struct peripheral_slot peripherals[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
 
 static bool is_scanning = false;
 
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+static int keyball_diag_subscribe_errors[ZMK_SPLIT_BLE_PERIPHERAL_COUNT];
+#endif
+
 #define SPLIT_CENTRAL_SCAN_RETRY_DELAY_MS 500
 
 static void split_central_scan_retry_work_handler(struct k_work *work) {
@@ -147,11 +152,14 @@ K_WORK_DELAYABLE_DEFINE(split_central_scan_retry_work, split_central_scan_retry_
 
 static void schedule_scan_retry(void) {
     if (!is_enabled) {
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_RETRY, 0, is_scanning,
+                                is_enabled, 0);
         return;
     }
 
     int err = k_work_reschedule(&split_central_scan_retry_work,
                                 K_MSEC(SPLIT_CENTRAL_SCAN_RETRY_DELAY_MS));
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_RETRY, err, is_scanning, is_enabled, 0);
     if (err < 0) {
         LOG_WRN("Failed to schedule split scan recovery (%d)", err);
     }
@@ -385,6 +393,10 @@ static uint8_t split_central_notify_func(struct bt_conn *conn,
 
     LOG_DBG("[NOTIFICATION] data %p length %u", data, length);
 
+    if (length >= POSITION_STATE_DATA_LEN) {
+        zmk_keyball_diag_split_rx(peripheral_slot_index_for_conn(conn), length);
+    }
+
     for (int i = 0; i < POSITION_STATE_DATA_LEN; i++) {
         slot->changed_positions[i] = ((uint8_t *)data)[i] ^ slot->position_state[i];
         slot->position_state[i] = ((uint8_t *)data)[i];
@@ -498,9 +510,29 @@ static uint8_t split_central_battery_level_read_func(struct bt_conn *conn, uint8
 
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING) */
 
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+static void split_central_subscribe_complete(struct bt_conn *conn, uint8_t err,
+                                             struct bt_gatt_subscribe_params *params) {
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SUBSCRIBE_COMPLETE, err,
+                            peripheral_slot_index_for_conn(conn), params->value_handle,
+                            params->ccc_handle);
+}
+#endif
+
 static int split_central_subscribe(struct bt_conn *conn, struct bt_gatt_subscribe_params *params) {
     atomic_set(params->flags, BT_GATT_SUBSCRIBE_FLAG_NO_RESUB);
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+    params->subscribe = split_central_subscribe_complete;
+#endif
     int err = bt_gatt_subscribe(conn, params);
+    int slot_idx = peripheral_slot_index_for_conn(conn);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SUBSCRIBE, err, slot_idx,
+                            params->value_handle, params->ccc_handle);
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+    if (slot_idx >= 0 && err != 0 && err != -EALREADY) {
+        keyball_diag_subscribe_errors[slot_idx] = err;
+    }
+#endif
     switch (err) {
     case -EALREADY:
         LOG_DBG("[ALREADY SUBSCRIBED]");
@@ -561,6 +593,10 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
                                                  struct bt_gatt_discover_params *params) {
     if (!attr) {
         LOG_DBG("Discover complete");
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_DISCOVER, 0, 3,
+                                peripheral_slot_index_for_conn(conn), 0);
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_READY, 0,
+                                peripheral_slot_index_for_conn(conn), 0, 0);
         return BT_GATT_ITER_STOP;
     }
 
@@ -728,7 +764,19 @@ static uint8_t split_central_chrc_discovery_func(struct bt_conn *conn,
     }
 #endif // IS_ENABLED(CONFIG_ZMK_INPUT_SPLIT)
 
-    return subscribed ? BT_GATT_ITER_STOP : BT_GATT_ITER_CONTINUE;
+    if (subscribed) {
+        int slot_idx = peripheral_slot_index_for_conn(conn);
+        bool diag_ready = true;
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+        if (slot_idx >= 0 && keyball_diag_subscribe_errors[slot_idx] != 0) {
+            diag_ready = false;
+        }
+#endif
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_READY, diag_ready, slot_idx, 0, 0);
+        return BT_GATT_ITER_STOP;
+    }
+
+    return BT_GATT_ITER_CONTINUE;
 }
 
 static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
@@ -736,6 +784,10 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
                                                     struct bt_gatt_discover_params *params) {
     if (!attr) {
         LOG_DBG("Discover complete");
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_DISCOVER, -ENOENT, 1,
+                                peripheral_slot_index_for_conn(conn), 0);
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_READY, 0,
+                                peripheral_slot_index_for_conn(conn), 0, 0);
         (void)memset(params, 0, sizeof(*params));
         return BT_GATT_ITER_STOP;
     }
@@ -760,6 +812,8 @@ static uint8_t split_central_service_discovery_func(struct bt_conn *conn,
     slot->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
     int err = bt_gatt_discover(conn, &slot->discover_params);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_DISCOVER, err, 2,
+                            peripheral_slot_index_for_conn(conn), 0);
     if (err) {
         LOG_ERR("Failed to start discovering split service characteristics (err %d)", err);
     }
@@ -785,6 +839,8 @@ static void split_central_process_connection(struct bt_conn *conn) {
         slot->discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
         err = bt_gatt_discover(slot->conn, &slot->discover_params);
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_DISCOVER, err, 1,
+                                peripheral_slot_index_for_conn(conn), 0);
         if (err) {
             LOG_ERR("Discover failed(err %d)", err);
             return;
@@ -811,6 +867,7 @@ static int stop_scanning(void) {
     }
 
     is_scanning = false;
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_STOP, err, is_scanning, is_enabled, 0);
     if (err < 0) {
         LOG_ERR("Stop LE scan failed (err %d)", err);
         schedule_scan_retry();
@@ -827,6 +884,8 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
     // the peripheral MAC addresses will be validated internally and the slot
     // reservation will fail if there is a mismatch.
     int slot_idx = reserve_peripheral_slot(addr);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SERVICE_FOUND, slot_idx, is_scanning,
+                            is_enabled, 0);
     if (slot_idx < 0) {
         LOG_INF("Unable to reserve peripheral slot (err %d)", slot_idx);
         return false;
@@ -845,6 +904,8 @@ static bool split_central_eir_found(const bt_addr_le_t *addr) {
         BT_LE_CONN_PARAM(CONFIG_ZMK_SPLIT_BLE_PREF_INT, CONFIG_ZMK_SPLIT_BLE_PREF_INT,
                          CONFIG_ZMK_SPLIT_BLE_PREF_LATENCY, CONFIG_ZMK_SPLIT_BLE_PREF_TIMEOUT);
     err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &slot->conn);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_CREATE, err, slot_idx, is_scanning,
+                            is_enabled);
     if (err < 0) {
         LOG_ERR("Create conn failed (err %d) (create conn? 0x%04x)", err, BT_HCI_OP_LE_CREATE_CONN);
         release_peripheral_slot(slot_idx);
@@ -912,12 +973,14 @@ static void split_central_device_found(const bt_addr_le_t *addr, int8_t rssi, ui
 static int start_scanning(void) {
     if (!is_enabled) {
         LOG_DBG("Not scanning, we're disabled");
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, 0, is_scanning, 1, 0);
         return 0;
     }
 
     // No action is necessary if central is already scanning.
     if (is_scanning) {
         LOG_DBG("Scanning already running");
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, 0, is_scanning, 2, 0);
         return 0;
     }
 
@@ -931,6 +994,7 @@ static int start_scanning(void) {
     }
     if (!has_unconnected) {
         LOG_DBG("All devices are connected, scanning is unnecessary");
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, 0, is_scanning, 3, 0);
         return 0;
     }
 
@@ -939,16 +1003,19 @@ static int start_scanning(void) {
     is_scanning = true;
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, split_central_device_found);
     if (err == -EALREADY) {
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, 0, is_scanning, 4, 0);
         return 0;
     }
     if (err < 0) {
         is_scanning = false;
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, err, is_scanning, 0, 0);
         LOG_ERR("Scanning failed to start (err %d)", err);
         schedule_scan_retry();
         return err;
     }
 
     LOG_DBG("Scanning successfully started");
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SCAN_START, 0, is_scanning, 0, 0);
     return 0;
 }
 
@@ -965,6 +1032,15 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
         return;
     }
 
+    int slot_idx = peripheral_slot_index_for_conn(conn);
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+    if (slot_idx >= 0) {
+        keyball_diag_subscribe_errors[slot_idx] = 0;
+    }
+#endif
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_CONNECTED, conn_err, slot_idx, info.le.interval,
+                            info.le.latency);
+
     if (conn_err) {
         LOG_ERR("Failed to connect to %s (%u)", addr, conn_err);
 
@@ -973,6 +1049,9 @@ static void split_central_connected(struct bt_conn *conn, uint8_t conn_err) {
         start_scanning();
         return;
     }
+
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_PARAMS, info.le.interval, info.le.latency,
+                            info.le.timeout, info.role);
 
     LOG_DBG("Connected: %s", addr);
 
@@ -996,6 +1075,8 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
     LOG_DBG("Disconnected: %s (reason %d)", addr, reason);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_DISCONNECTED, reason, slot_idx, is_scanning,
+                            is_enabled);
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING)
     struct peripheral_event_wrapper ev = {
@@ -1031,7 +1112,14 @@ static void split_central_disconnected(struct bt_conn *conn, uint8_t reason) {
 static void split_central_security_changed(struct bt_conn *conn, bt_security_t level,
                                            enum bt_security_err err) {
     struct peripheral_slot *slot = peripheral_slot_for_conn(conn);
-    if (!slot || !slot->selected_physical_layout_handle) {
+    if (!slot) {
+        return;
+    }
+
+    int slot_idx = peripheral_slot_index_for_conn(conn);
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_SECURITY, level, err, slot_idx, 0);
+
+    if (!slot->selected_physical_layout_handle) {
         return;
     }
 
@@ -1249,6 +1337,7 @@ static int split_central_bt_get_available_source_ids(uint8_t *sources) {
 
 static int split_central_bt_set_enabled(bool enabled) {
     is_enabled = enabled;
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_ENABLED, enabled, is_scanning, 0, 0);
     if (enabled) {
         return start_scanning();
     } else {
@@ -1311,19 +1400,26 @@ static const struct zmk_split_transport_central_api central_api = {
 ZMK_SPLIT_TRANSPORT_CENTRAL_REGISTER(bt_central, &central_api, CONFIG_ZMK_SPLIT_BLE_PRIORITY);
 
 static void notify_transport_status(void) {
+    struct zmk_split_transport_status status = split_central_bt_get_status();
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_STATUS, status.enabled, status.connections,
+                            status.available, is_scanning);
     if (transport_status_cb) {
-        transport_status_cb(&bt_central, split_central_bt_get_status());
+        transport_status_cb(&bt_central, status);
     }
 }
 
 static int finish_init() {
     settings_loaded = true;
 
+    struct zmk_split_transport_status status = split_central_bt_get_status();
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_STATUS, status.enabled, status.connections,
+                            status.available, is_scanning);
+
     if (!transport_status_cb) {
         return 0;
     }
 
-    return transport_status_cb(&bt_central, split_central_bt_get_status());
+    return transport_status_cb(&bt_central, status);
 }
 
 void peripheral_event_work_callback(struct k_work *work) {

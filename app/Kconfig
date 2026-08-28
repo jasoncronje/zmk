@@ -220,6 +220,17 @@ config ZMK_BLE_MOUSE_REPORT_INTERVAL_MS
       coalescing. Button changes are always sent immediately, and accumulated
       relative movement is preserved and flushed after the interval.
 
+config ZMK_KEYBALL_DIAGNOSTICS
+    bool "RAM-only Keyball Bluetooth timing capture"
+    depends on ZMK_POINTING && ZMK_BLE && ZMK_SPLIT_ROLE_CENTRAL && PMW3610
+    depends on ZMK_STUDIO_TRANSPORT_UART && USB_DEVICE_STACK
+    depends on UART_INTERRUPT_DRIVEN && UART_LINE_CTRL
+    help
+      Capture input, HID-over-GATT, host-link, and split-link timing in a
+      fixed-size RAM ring. Capture is frozen when USB is attached and dumped
+      on the Studio CDC UART only after a serial client asserts DTR. This does
+      not log or write flash while Bluetooth capture is active.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

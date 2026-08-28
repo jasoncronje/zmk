@@ -32,6 +32,7 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/ble.h>
+#include <zmk/keyball_diag.h>
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -510,6 +511,9 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         return;
     }
 
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_HOST_CONNECTED, err, info.role, info.le.interval,
+                            info.le.latency);
+
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     advertising_status = ZMK_ADV_NONE;
 
@@ -518,6 +522,9 @@ static void connected(struct bt_conn *conn, uint8_t err) {
         update_advertising();
         return;
     }
+
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_HOST_PARAMS, info.le.interval, info.le.latency,
+                            info.le.timeout, info.role);
 
     LOG_DBG("Connected %s", addr);
 
@@ -544,6 +551,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
         return;
     }
 
+    zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_HOST_DISCONNECTED, reason, info.role, 0, 0);
+
     // We need to do this in a work callback, otherwise the advertising update will still see the
     // connection for a profile as active, and not start advertising yet.
     k_work_submit(&update_advertising_work);
@@ -559,6 +568,11 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_HOST_SECURITY, level, err, info.role, 0);
+    }
+
     if (!err) {
         LOG_DBG("Security changed: %s level %u", addr, level);
     } else {
@@ -571,6 +585,17 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t l
     char addr[BT_ADDR_LE_STR_LEN];
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) == 0) {
+        if (info.role == BT_CONN_ROLE_PERIPHERAL) {
+            zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_HOST_PARAMS, interval, latency, timeout,
+                                    info.role);
+        } else if (info.role == BT_CONN_ROLE_CENTRAL) {
+            zmk_keyball_diag_record(ZMK_KEYBALL_DIAG_SPLIT_PARAMS, interval, latency, timeout,
+                                    info.role);
+        }
+    }
 
     LOG_DBG("%s: interval %d latency %d timeout %d", addr, interval, latency, timeout);
 }

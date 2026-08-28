@@ -22,6 +22,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/endpoints_types.h>
 #include <zmk/hog.h>
 #include <zmk/hid.h>
+#include <zmk/keyball_diag.h>
 #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
 #include <zmk/pointing/resolution_multipliers.h>
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
@@ -414,15 +415,32 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+static void keyball_diag_mouse_notify_complete(struct bt_conn *conn, void *user_data) {
+    ARG_UNUSED(conn);
+    zmk_keyball_diag_notify_complete((uint32_t)(uintptr_t)user_data);
+}
+#endif
+
 static int notify_mouse_report(struct bt_conn *conn,
                                const struct zmk_hid_mouse_report_body *report) {
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+    uint32_t diag_id = zmk_keyball_diag_notify_begin(report->d_x, report->d_y);
+#endif
     struct bt_gatt_notify_params notify_params = {
         .attr = &hog_svc.attrs[13],
         .data = report,
         .len = sizeof(*report),
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+        .func = keyball_diag_mouse_notify_complete,
+        .user_data = (void *)(uintptr_t)diag_id,
+#endif
     };
 
     int err = bt_gatt_notify_cb(conn, &notify_params);
+#if IS_ENABLED(CONFIG_ZMK_KEYBALL_DIAGNOSTICS)
+    zmk_keyball_diag_notify_result(diag_id, err);
+#endif
     if (err == -EPERM) {
         bt_conn_set_security(conn, BT_SECURITY_L2);
     } else if (err) {
@@ -568,8 +586,10 @@ static bool mouse_coalescer_next_delay_locked(int64_t now, int64_t *delay_ms) {
 }
 
 static void schedule_mouse_report(int64_t delay_ms) {
+    zmk_keyball_diag_schedule_due(delay_ms);
     int err = k_work_reschedule_for_queue(&hog_mouse_work_q, &hog_mouse_work,
                                           delay_ms > 0 ? K_MSEC(delay_ms) : K_NO_WAIT);
+    zmk_keyball_diag_schedule_result(delay_ms, err);
     if (err < 0) {
         LOG_WRN("Failed to schedule mouse report (%d)", err);
     }
@@ -582,6 +602,7 @@ static bool mouse_conn_is_connected(struct bt_conn *conn) {
 }
 
 static void send_mouse_report_callback(struct k_work *work) {
+    zmk_keyball_diag_work();
     struct mouse_report_snapshot snapshot;
     struct bt_conn *conn = NULL;
     int64_t delay_ms = 0;
@@ -683,6 +704,8 @@ static void mouse_segment_add_report(struct mouse_report_segment *segment,
 }
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+    zmk_keyball_diag_hog_enqueue(report->d_x, report->d_y, report->d_scroll_y,
+                                 report->d_scroll_x);
     struct bt_conn *conn = zmk_ble_active_profile_conn();
     if (!mouse_conn_is_connected(conn)) {
         if (conn != NULL) {
@@ -694,6 +717,7 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         if (needs_reset) {
             zmk_hog_reset_mouse_reports();
         }
+        zmk_keyball_diag_hog_result(0, false);
         return 0;
     }
 
@@ -756,6 +780,7 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
         schedule_mouse_report(delay_ms);
     }
 
+    zmk_keyball_diag_hog_result(0, true);
     return 0;
 }
 

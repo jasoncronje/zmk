@@ -11,6 +11,7 @@
 #include <zephyr/sys/ring_buffer.h>
 
 #include <zephyr/logging/log.h>
+#include <zmk/keyball_diag.h>
 #include <zmk/studio/rpc.h>
 
 LOG_MODULE_DECLARE(zmk_studio, CONFIG_ZMK_STUDIO_LOG_LEVEL);
@@ -24,7 +25,9 @@ static void tx_notify(struct ring_buf *tx_ring_buf, size_t written, bool msg_don
                       void *user_data) {
     if (msg_done || (ring_buf_size_get(tx_ring_buf) > (ring_buf_capacity_get(tx_ring_buf) / 2))) {
 #if IS_ENABLED(CONFIG_UART_INTERRUPT_DRIVEN)
-        uart_irq_tx_enable(uart_dev);
+        if (!zmk_keyball_diag_uart_claimed()) {
+            uart_irq_tx_enable(uart_dev);
+        }
 #else
         struct ring_buf *tx_buf = zmk_rpc_get_tx_buf();
         uint8_t *buf;
@@ -97,6 +100,12 @@ ZMK_RPC_TRANSPORT(uart, ZMK_TRANSPORT_USB, start_rx, stop_rx, NULL, tx_notify);
  */
 static void serial_cb(const struct device *dev, void *user_data) {
     if (!uart_irq_update(uart_dev)) {
+        return;
+    }
+
+    if (zmk_keyball_diag_uart_claimed()) {
+        uart_irq_tx_disable(uart_dev);
+        uart_irq_rx_disable(uart_dev);
         return;
     }
 

@@ -25,6 +25,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
 
 #include <zmk/hid.h>
+#include <zmk/keyball_diag.h>
 #include <zmk/keymap.h>
 
 #define ONE_IF_DEV_OK(n)                                                                           \
@@ -292,6 +293,10 @@ static void input_handler(const struct input_listener_config *config,
     }
 
     if (evt->sync) {
+        zmk_keyball_diag_input(data->mouse.data.x.value, data->mouse.data.y.value,
+                               data->mouse.wheel_data.y.value,
+                               data->mouse.wheel_data.x.value);
+
         if (data->mouse.wheel_data.mode == INPUT_LISTENER_XY_DATA_MODE_REL) {
             zmk_hid_mouse_scroll_set(data->mouse.wheel_data.x.value,
                                      data->mouse.wheel_data.y.value);
