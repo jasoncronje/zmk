@@ -410,6 +410,138 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *report) {
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_COALESCE)
+
+/*
+ * One mouse notification in flight at a time. Reports that arrive while it is
+ * on the air are summed into the newest waiting report (same buttons), so each
+ * connection event carries one report holding all movement since the last one,
+ * and a fast sensor can never build a backlog. A button change starts a new
+ * report so no click is merged away.
+ */
+
+#define MOUSE_PENDING_MAX CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
+// A sent callback lost to a disconnect must not stall the mouse for good
+#define MOUSE_IN_FLIGHT_TIMEOUT_MS 100
+
+static struct k_spinlock mouse_lock;
+static struct zmk_hid_mouse_report_body mouse_pending[MOUSE_PENDING_MAX];
+static uint8_t mouse_pending_head;
+static uint8_t mouse_pending_count;
+static bool mouse_in_flight;
+static int64_t mouse_sent_at;
+
+void send_mouse_report_callback(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(hog_mouse_work, send_mouse_report_callback);
+
+static bool add_fits(int16_t a, int16_t b) {
+    int32_t sum = (int32_t)a + b;
+    return sum >= INT16_MIN && sum <= INT16_MAX;
+}
+
+static bool mouse_report_merge(struct zmk_hid_mouse_report_body *into,
+                               const struct zmk_hid_mouse_report_body *report) {
+    if (into->buttons != report->buttons || !add_fits(into->d_x, report->d_x) ||
+        !add_fits(into->d_y, report->d_y) || !add_fits(into->d_scroll_x, report->d_scroll_x) ||
+        !add_fits(into->d_scroll_y, report->d_scroll_y)) {
+        return false;
+    }
+
+    into->d_x += report->d_x;
+    into->d_y += report->d_y;
+    into->d_scroll_x += report->d_scroll_x;
+    into->d_scroll_y += report->d_scroll_y;
+    return true;
+}
+
+static void mouse_report_sent(struct bt_conn *conn, void *user_data) {
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
+    mouse_in_flight = false;
+    k_spin_unlock(&mouse_lock, key);
+
+    k_work_reschedule_for_queue(&hog_work_q, &hog_mouse_work, K_NO_WAIT);
+}
+
+void send_mouse_report_callback(struct k_work *work) {
+    struct zmk_hid_mouse_report_body report;
+
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
+    if (mouse_in_flight) {
+        int64_t waited = k_uptime_get() - mouse_sent_at;
+        if (waited < MOUSE_IN_FLIGHT_TIMEOUT_MS) {
+            k_spin_unlock(&mouse_lock, key);
+            k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work,
+                                      K_MSEC(MOUSE_IN_FLIGHT_TIMEOUT_MS - waited));
+            return;
+        }
+        LOG_WRN("Mouse report sent callback missing, sending the next one anyway");
+    }
+    if (mouse_pending_count == 0) {
+        mouse_in_flight = false;
+        k_spin_unlock(&mouse_lock, key);
+        return;
+    }
+    report = mouse_pending[mouse_pending_head];
+    mouse_pending_head = (mouse_pending_head + 1) % MOUSE_PENDING_MAX;
+    mouse_pending_count--;
+    mouse_in_flight = true;
+    mouse_sent_at = k_uptime_get();
+    k_spin_unlock(&mouse_lock, key);
+
+    struct bt_conn *conn = zmk_ble_active_profile_conn();
+    if (conn == NULL) {
+        key = k_spin_lock(&mouse_lock);
+        mouse_in_flight = false;
+        k_spin_unlock(&mouse_lock, key);
+        return;
+    }
+
+    struct bt_gatt_notify_params notify_params = {
+        .attr = &hog_svc.attrs[13],
+        .data = &report,
+        .len = sizeof(report),
+        .func = mouse_report_sent,
+    };
+
+    int err = bt_gatt_notify_cb(conn, &notify_params);
+    if (err) {
+        key = k_spin_lock(&mouse_lock);
+        mouse_in_flight = false;
+        k_spin_unlock(&mouse_lock, key);
+
+        if (err == -EPERM) {
+            bt_conn_set_security(conn, BT_SECURITY_L2);
+        } else {
+            LOG_DBG("Error notifying %d", err);
+        }
+    }
+
+    bt_conn_unref(conn);
+}
+
+int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
+    uint8_t tail = (mouse_pending_head + mouse_pending_count + MOUSE_PENDING_MAX - 1) %
+                   MOUSE_PENDING_MAX;
+    if (mouse_pending_count == 0 || !mouse_report_merge(&mouse_pending[tail], report)) {
+        if (mouse_pending_count == MOUSE_PENDING_MAX) {
+            LOG_WRN("Mouse report queue full, dropping the oldest report");
+            mouse_pending_head = (mouse_pending_head + 1) % MOUSE_PENDING_MAX;
+            mouse_pending_count--;
+        }
+        tail = (mouse_pending_head + mouse_pending_count) % MOUSE_PENDING_MAX;
+        mouse_pending[tail] = *report;
+        mouse_pending_count++;
+    }
+    k_spin_unlock(&mouse_lock, key);
+
+    k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_NO_WAIT);
+
+    return 0;
+};
+
+#else // IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_COALESCE)
+
 K_MSGQ_DEFINE(zmk_hog_mouse_msgq, sizeof(struct zmk_hid_mouse_report_body),
               CONFIG_ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE, 4);
 
@@ -460,6 +592,8 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
 
     return 0;
 };
+#endif // IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_COALESCE)
+
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
 static int zmk_hog_init(void) {
