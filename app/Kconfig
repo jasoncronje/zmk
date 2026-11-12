@@ -210,13 +210,13 @@ config ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE
     default 20
 
 config ZMK_BLE_MOUSE_REPORT_COALESCE
-    bool "Send one BLE mouse report at a time, summing movement that arrives meanwhile"
+    bool "Send at most one BLE mouse report per connection interval, summing movement in between"
     help
-      Keeps one mouse notification in flight and adds movement that arrives
-      while it is on the air into the next report, so each connection event
-      carries everything since the last one and reports never back up.
-      ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE then only bounds reports with
-      different button states.
+      Paces mouse notifications to one per connection interval and adds
+      movement that arrives in between into the next report, so each
+      connection event carries everything since the last one and reports
+      never back up. ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE then only bounds
+      reports with different button states.
 
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
