@@ -218,6 +218,16 @@ config ZMK_BLE_MOUSE_REPORT_COALESCE
       never back up. ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE then only bounds
       reports with different button states.
 
+config ZMK_BLE_HOST_OFF_ON_USB
+    bool "Drop host Bluetooth while USB is the chosen output and a cable is plugged in"
+    depends on ZMK_USB
+    help
+      While the preferred output is USB (&out OUT_USB, or OUT_TOG to USB) and
+      USB has power, disconnect every host (BLE peripheral-role) connection
+      and stop advertising, so no host can reconnect. Split links are left
+      alone. Switching back to BLE, or unplugging the cable, resumes
+      advertising and bonded hosts reconnect as usual.
+
 config ZMK_BLE_CLEAR_BONDS_ON_START
     bool "Configuration that clears all bond information from the keyboard on startup."
 

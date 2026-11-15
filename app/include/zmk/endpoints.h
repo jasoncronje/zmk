@@ -64,6 +64,12 @@ int zmk_endpoints_select_transport(enum zmk_transport transport);
 int zmk_endpoints_toggle_transport(void);
 
 /**
+ * The transport chosen by the user, which may differ from the selected one
+ * when that transport is not ready.
+ */
+enum zmk_transport zmk_endpoints_preferred_transport(void);
+
+/**
  * Gets the currently-selected endpoint.
  */
 struct zmk_endpoint_instance zmk_endpoints_selected(void);

@@ -44,6 +44,11 @@ int zmk_ble_unpair_all(void);
 
 int zmk_ble_set_device_name(char *name);
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+/* Re-check whether host connections should be up (preferred transport or USB power changed). */
+void zmk_ble_host_off_update(void);
+#endif
+
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 int zmk_ble_put_peripheral_addr(const bt_addr_le_t *addr);
 #endif /* IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL) */

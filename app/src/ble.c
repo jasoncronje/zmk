@@ -32,6 +32,10 @@
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/ble.h>
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+#include <zmk/endpoints.h>
+#include <zmk/usb.h>
+#endif
 #include <zmk/keys.h>
 #include <zmk/split/bluetooth/uuid.h>
 #include <zmk/event_manager.h>
@@ -175,13 +179,32 @@ bool zmk_ble_profile_is_connected(uint8_t index) {
     }                                                                                              \
     advertising_status = ZMK_ADV_CONN;
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+static bool host_ble_off(void) {
+    return zmk_endpoints_preferred_transport() == ZMK_TRANSPORT_USB &&
+           zmk_usb_get_conn_state() != ZMK_USB_CONN_NONE;
+}
+
+static void disconnect_host_conn(struct bt_conn *conn, void *data) {
+    struct bt_conn_info info;
+
+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
+}
+#else
+static inline bool host_ble_off(void) { return false; }
+#endif
+
 int update_advertising(void) {
     int err = 0;
     bt_addr_le_t *addr;
     struct bt_conn *conn;
     enum advertising_type desired_adv = ZMK_ADV_NONE;
 
-    if (zmk_ble_active_profile_is_open()) {
+    if (host_ble_off()) {
+        desired_adv = ZMK_ADV_NONE;
+    } else if (zmk_ble_active_profile_is_open()) {
         desired_adv = ZMK_ADV_CONN;
     } else if (!zmk_ble_active_profile_is_connected()) {
         desired_adv = ZMK_ADV_CONN;
@@ -223,6 +246,20 @@ int update_advertising(void) {
 static void update_advertising_callback(struct k_work *work) { update_advertising(); }
 
 K_WORK_DEFINE(update_advertising_work, update_advertising_callback);
+
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+static void host_off_update_callback(struct k_work *work) {
+    if (host_ble_off()) {
+        LOG_INF("USB output chosen and powered: dropping host BLE");
+        bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_host_conn, NULL);
+    }
+    update_advertising();
+}
+
+K_WORK_DEFINE(host_off_update_work, host_off_update_callback);
+
+void zmk_ble_host_off_update(void) { k_work_submit(&host_off_update_work); }
+#endif
 
 static void clear_profile_bond(uint8_t profile) {
     if (bt_addr_le_cmp(&profiles[profile].peer, BT_ADDR_LE_ANY)) {
@@ -512,6 +549,12 @@ static void connected(struct bt_conn *conn, uint8_t err) {
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     advertising_status = ZMK_ADV_NONE;
+
+    if (!err && host_ble_off()) {
+        LOG_DBG("Host BLE is off for USB, dropping %s", addr);
+        bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        return;
+    }
 
     if (err) {
         LOG_WRN("Failed to connect to %s (%u)", addr, err);

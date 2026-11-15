@@ -105,6 +105,10 @@ int zmk_endpoints_select_transport(enum zmk_transport transport) {
 
     endpoints_save_preferred();
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+    zmk_ble_host_off_update();
+#endif
+
     update_current_endpoint();
 
     return 0;
@@ -115,6 +119,8 @@ int zmk_endpoints_toggle_transport(void) {
         (preferred_transport == ZMK_TRANSPORT_USB) ? ZMK_TRANSPORT_BLE : ZMK_TRANSPORT_USB;
     return zmk_endpoints_select_transport(new_transport);
 }
+
+enum zmk_transport zmk_endpoints_preferred_transport(void) { return preferred_transport; }
 
 struct zmk_endpoint_instance zmk_endpoints_selected(void) { return current_instance; }
 
@@ -358,6 +364,11 @@ static void update_current_endpoint(void) {
 }
 
 static int endpoint_listener(const zmk_event_t *eh) {
+#if IS_ENABLED(CONFIG_ZMK_BLE_HOST_OFF_ON_USB)
+    if (as_zmk_usb_conn_state_changed(eh) != NULL) {
+        zmk_ble_host_off_update();
+    }
+#endif
     update_current_endpoint();
     return 0;
 }
