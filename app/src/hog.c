@@ -467,40 +467,46 @@ static int64_t mouse_interval_us(struct bt_conn *conn) {
 
 static int64_t now_us(void) { return k_ticks_to_us_floor64(k_uptime_ticks()); }
 
-void send_mouse_report_callback(struct k_work *work) {
-    struct zmk_hid_mouse_report_body report;
+// Caller holds mouse_lock
+static void mouse_queue_push(const struct zmk_hid_mouse_report_body *report) {
+    uint8_t tail = (mouse_pending_head + mouse_pending_count + MOUSE_PENDING_MAX - 1) %
+                   MOUSE_PENDING_MAX;
+    if (mouse_pending_count > 0 && mouse_report_merge(&mouse_pending[tail], report)) {
+        return;
+    }
+    if (mouse_pending_count == MOUSE_PENDING_MAX) {
+        LOG_WRN("Mouse report queue full, dropping the oldest report");
+        mouse_pending_head = (mouse_pending_head + 1) % MOUSE_PENDING_MAX;
+        mouse_pending_count--;
+    }
+    tail = (mouse_pending_head + mouse_pending_count) % MOUSE_PENDING_MAX;
+    mouse_pending[tail] = *report;
+    mouse_pending_count++;
+}
 
-    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
-    if (mouse_pending_count == 0) {
-        k_spin_unlock(&mouse_lock, key);
-        return;
-    }
-    int64_t wait = mouse_next_send_us - now_us();
-    if (wait > 0) {
-        k_spin_unlock(&mouse_lock, key);
-        k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_USEC(wait));
-        return;
-    }
-    report = mouse_pending[mouse_pending_head];
+// Caller holds mouse_lock
+static void mouse_queue_pop(struct zmk_hid_mouse_report_body *report) {
+    *report = mouse_pending[mouse_pending_head];
     mouse_pending_head = (mouse_pending_head + 1) % MOUSE_PENDING_MAX;
     mouse_pending_count--;
-    bool more = mouse_pending_count > 0;
-    k_spin_unlock(&mouse_lock, key);
+}
 
+// Sends one report and, if more is waiting, comes back after one interval
+static void mouse_notify(struct zmk_hid_mouse_report_body *report, bool more) {
     struct bt_conn *conn = zmk_ble_active_profile_conn();
     if (conn == NULL) {
         return;
     }
 
     int64_t interval = mouse_interval_us(conn);
-    key = k_spin_lock(&mouse_lock);
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
     mouse_next_send_us = now_us() + interval;
     k_spin_unlock(&mouse_lock, key);
 
     struct bt_gatt_notify_params notify_params = {
         .attr = &hog_svc.attrs[13],
-        .data = &report,
-        .len = sizeof(report),
+        .data = report,
+        .len = sizeof(*report),
     };
 
     int err = bt_gatt_notify_cb(conn, &notify_params);
@@ -517,20 +523,205 @@ void send_mouse_report_callback(struct k_work *work) {
     }
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_RESAMPLE)
+
+/*
+ * Even time slices. Each sensor reading is movement spread evenly over the time
+ * since the previous reading. A report sent at time T carries exactly the
+ * movement that falls before T - one sample period, with fractions of a count
+ * kept for the next report. At a steady ball speed every report then holds the
+ * same counts, however the sensor's readings line up with the connection
+ * interval (otherwise a 4 ms sensor on a 15 ms link alternates 4 and 3 readings
+ * per report, and macOS accelerates the 4s more). Costs one sample period of
+ * latency. Only x/y movement is resampled; buttons and scroll go through the
+ * queue, and a button change first flushes all movement so clicks land where
+ * the pointer was.
+ */
+
+#define RS_SEGMENTS 8
+#define RS_SAMPLE_US CONFIG_ZMK_BLE_MOUSE_REPORT_RESAMPLE_SAMPLE_US
+#define RS_ONE 256 // fixed point: 1/256 count
+
+struct rs_segment {
+    int64_t start_us; // movement before this has been sent
+    int64_t end_us;
+    int32_t x, y; // movement left in [start_us, end_us], 1/256 counts
+};
+
+static struct rs_segment rs_seg[RS_SEGMENTS];
+static uint8_t rs_head;
+static uint8_t rs_count;
+static int64_t rs_last_us;
+static int32_t rs_acc_x, rs_acc_y;
+static zmk_mouse_button_flags_t rs_buttons;
+
+static int16_t clamp16(int32_t v) {
+    return v > INT16_MAX ? INT16_MAX : (v < INT16_MIN ? INT16_MIN : (int16_t)v);
+}
+
+// Caller holds mouse_lock
+static void rs_add(int16_t dx, int16_t dy, int64_t now) {
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+    int64_t dur = now - rs_last_us;
+    if (rs_count > 0 && dur < RS_SAMPLE_US / 4) {
+        // Same reading split over several reports: add it to the newest slice
+        struct rs_segment *s = &rs_seg[(rs_head + rs_count - 1) % RS_SEGMENTS];
+        s->x += dx * RS_ONE;
+        s->y += dy * RS_ONE;
+        return;
+    }
+    if (dur <= 0 || dur > 2 * RS_SAMPLE_US) {
+        dur = RS_SAMPLE_US; // first reading after a pause
+    }
+    if (rs_count == RS_SEGMENTS) {
+        // Link stalled: hand the oldest slice over whole
+        rs_acc_x += rs_seg[rs_head].x;
+        rs_acc_y += rs_seg[rs_head].y;
+        rs_head = (rs_head + 1) % RS_SEGMENTS;
+        rs_count--;
+    }
+    rs_seg[(rs_head + rs_count) % RS_SEGMENTS] = (struct rs_segment){
+        .start_us = now - dur, .end_us = now, .x = dx * RS_ONE, .y = dy * RS_ONE};
+    rs_count++;
+    rs_last_us = now;
+}
+
+static int16_t rs_out(int32_t *acc, bool last) {
+    int32_t q = last ? (*acc + (*acc >= 0 ? RS_ONE / 2 : -RS_ONE / 2)) / RS_ONE : *acc / RS_ONE;
+    int16_t out = clamp16(q);
+    *acc -= (int32_t)out * RS_ONE;
+    if (last && *acc > -RS_ONE && *acc < RS_ONE) {
+        *acc = 0; // pointer stopped: no leftover fraction to creep later
+    }
+    return out;
+}
+
+// Movement before cutoff. Caller holds mouse_lock.
+static void rs_take(int64_t cutoff, int16_t *x, int16_t *y) {
+    while (rs_count > 0) {
+        struct rs_segment *s = &rs_seg[rs_head];
+        if (s->end_us <= cutoff) {
+            rs_acc_x += s->x;
+            rs_acc_y += s->y;
+            rs_head = (rs_head + 1) % RS_SEGMENTS;
+            rs_count--;
+            continue;
+        }
+        if (s->start_us < cutoff) {
+            int64_t span = s->end_us - s->start_us;
+            int32_t px = (int32_t)((int64_t)s->x * (cutoff - s->start_us) / span);
+            int32_t py = (int32_t)((int64_t)s->y * (cutoff - s->start_us) / span);
+            rs_acc_x += px;
+            rs_acc_y += py;
+            s->x -= px;
+            s->y -= py;
+            s->start_us = cutoff;
+        }
+        break;
+    }
+    bool last = rs_count == 0;
+    *x = rs_out(&rs_acc_x, last);
+    *y = rs_out(&rs_acc_y, last);
+}
+
+static bool rs_pending(void) { return rs_count > 0 || rs_acc_x != 0 || rs_acc_y != 0; }
+
+void send_mouse_report_callback(struct k_work *work) {
+    struct zmk_hid_mouse_report_body report;
+
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
+    if (mouse_pending_count == 0 && !rs_pending()) {
+        k_spin_unlock(&mouse_lock, key);
+        return;
+    }
+    int64_t now = now_us();
+    int64_t wait = mouse_next_send_us - now;
+    if (wait > 0) {
+        k_spin_unlock(&mouse_lock, key);
+        k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_USEC(wait));
+        return;
+    }
+    if (mouse_pending_count > 1) {
+        // Older button states first; resampled movement comes after them
+        mouse_queue_pop(&report);
+    } else {
+        int16_t rx, ry;
+        rs_take(now - RS_SAMPLE_US, &rx, &ry);
+        if (mouse_pending_count == 1) {
+            mouse_queue_pop(&report);
+            report.d_x = clamp16((int32_t)report.d_x + rx);
+            report.d_y = clamp16((int32_t)report.d_y + ry);
+        } else if (rx != 0 || ry != 0) {
+            report = (struct zmk_hid_mouse_report_body){
+                .buttons = rs_buttons, .d_x = rx, .d_y = ry};
+        } else {
+            // Nothing due yet (first reading after a pause): look again shortly
+            bool pending = rs_pending();
+            k_spin_unlock(&mouse_lock, key);
+            if (pending) {
+                k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_USEC(1000));
+            }
+            return;
+        }
+    }
+    bool more = mouse_pending_count > 0 || rs_pending();
+    k_spin_unlock(&mouse_lock, key);
+
+    mouse_notify(&report, more);
+}
+
+#else // IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_RESAMPLE)
+
+void send_mouse_report_callback(struct k_work *work) {
+    struct zmk_hid_mouse_report_body report;
+
+    k_spinlock_key_t key = k_spin_lock(&mouse_lock);
+    if (mouse_pending_count == 0) {
+        k_spin_unlock(&mouse_lock, key);
+        return;
+    }
+    int64_t wait = mouse_next_send_us - now_us();
+    if (wait > 0) {
+        k_spin_unlock(&mouse_lock, key);
+        k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_USEC(wait));
+        return;
+    }
+    mouse_queue_pop(&report);
+    bool more = mouse_pending_count > 0;
+    k_spin_unlock(&mouse_lock, key);
+
+    mouse_notify(&report, more);
+}
+
+#endif // IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_RESAMPLE)
+
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
     k_spinlock_key_t key = k_spin_lock(&mouse_lock);
-    uint8_t tail = (mouse_pending_head + mouse_pending_count + MOUSE_PENDING_MAX - 1) %
-                   MOUSE_PENDING_MAX;
-    if (mouse_pending_count == 0 || !mouse_report_merge(&mouse_pending[tail], report)) {
-        if (mouse_pending_count == MOUSE_PENDING_MAX) {
-            LOG_WRN("Mouse report queue full, dropping the oldest report");
-            mouse_pending_head = (mouse_pending_head + 1) % MOUSE_PENDING_MAX;
-            mouse_pending_count--;
+#if IS_ENABLED(CONFIG_ZMK_BLE_MOUSE_REPORT_RESAMPLE)
+    if (report->buttons != rs_buttons) {
+        int16_t fx, fy;
+        rs_take(INT64_MAX, &fx, &fy);
+        if (fx != 0 || fy != 0) {
+            struct zmk_hid_mouse_report_body moved = {
+                .buttons = rs_buttons, .d_x = fx, .d_y = fy};
+            mouse_queue_push(&moved);
         }
-        tail = (mouse_pending_head + mouse_pending_count) % MOUSE_PENDING_MAX;
-        mouse_pending[tail] = *report;
-        mouse_pending_count++;
+        mouse_queue_push(report);
+        rs_buttons = report->buttons;
+    } else {
+        rs_add(report->d_x, report->d_y, now_us());
+        if (report->d_scroll_x != 0 || report->d_scroll_y != 0) {
+            struct zmk_hid_mouse_report_body scroll = {.buttons = rs_buttons,
+                                                       .d_scroll_x = report->d_scroll_x,
+                                                       .d_scroll_y = report->d_scroll_y};
+            mouse_queue_push(&scroll);
+        }
     }
+#else
+    mouse_queue_push(report);
+#endif
     k_spin_unlock(&mouse_lock, key);
 
     k_work_schedule_for_queue(&hog_work_q, &hog_mouse_work, K_NO_WAIT);

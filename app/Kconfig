@@ -218,6 +218,21 @@ config ZMK_BLE_MOUSE_REPORT_COALESCE
       never back up. ZMK_BLE_MOUSE_REPORT_QUEUE_SIZE then only bounds
       reports with different button states.
 
+config ZMK_BLE_MOUSE_REPORT_RESAMPLE
+    bool "Give every coalesced BLE mouse report the same slice of time"
+    depends on ZMK_BLE_MOUSE_REPORT_COALESCE
+    help
+      Spreads each sensor reading evenly over the time since the previous
+      one and sends, with each report, exactly the movement up to one sample
+      period ago, keeping fractions of a count. At a steady ball speed every
+      report then carries the same counts, even when the sensor rate does
+      not divide the connection interval. Adds one sample period of latency.
+
+config ZMK_BLE_MOUSE_REPORT_RESAMPLE_SAMPLE_US
+    int "Pointing sensor sample period in microseconds"
+    depends on ZMK_BLE_MOUSE_REPORT_RESAMPLE
+    default 4000
+
 config ZMK_BLE_HOST_OFF_ON_USB
     bool "Drop host Bluetooth while USB is the chosen output and a cable is plugged in"
     depends on ZMK_USB
